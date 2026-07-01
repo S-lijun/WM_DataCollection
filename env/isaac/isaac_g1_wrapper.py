@@ -27,18 +27,6 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
         "spawn_x_range": (1.5, 4.0),
         "spawn_y_range": (-2.0, 2.0),
     },
-    "table_0": {
-        "default_z": 0.5,
-        "rot": (0.5, 0.5, 0.5, 0.5),
-        "spawn_x_range": (2.0, 4.5),
-        "spawn_y_range": (-2.0, 2.0),
-    },
-    "chair_0": {
-        "default_z": 0.5,
-        "rot": (0.5, 0.5, -0.5, -0.5),
-        "spawn_x_range": (1.5, 4.0),
-        "spawn_y_range": (-2.0, 2.0),
-    },
 }
 
 HIDDEN_OBSTACLE_POS = (100.0, 100.0, -10.0)
@@ -146,7 +134,7 @@ class IsaacG1Wrapper:
         if self.demos_dir not in sys.path:
             sys.path.insert(0, self.demos_dir)
 
-        from data_collection_obstacles import add_blue_bin, add_chair, add_table
+        from data_collection_obstacles import add_blue_bin
         import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
         from rsl_rl.runners import OnPolicyRunner
         from isaaclab.envs import ManagerBasedRLEnv
@@ -171,6 +159,11 @@ class IsaacG1Wrapper:
             load_lab_scene_usd,
             rotate_sensor_ccw_to_landscape,
         )
+        self._rotate_sensor_ccw_to_landscape = rotate_sensor_ccw_to_landscape
+        self._resize_rgb = resize_rgb
+        self._merge_depth_maps_multi = merge_depth_maps_multi
+        self._depth_to_rgb = depth_to_rgb
+        self._lidar_ranges_to_rgb = lidar_ranges_to_rgb
         import isaaclab.sim as sim_utils
         import omni.usd
         from pxr import Gf, Sdf, UsdGeom
@@ -211,8 +204,6 @@ class IsaacG1Wrapper:
         env_cfg.terminations.base_contact = None
 
         add_blue_bin(env_cfg, pos=(2.0, 0.0, 0.5), index=0)
-        add_table(env_cfg, pos=(4.0, 0.0, 0.5), index=0)
-        add_chair(env_cfg, pos=(2.0, 0.0, 0.5), index=0)
 
         env_cfg.scene.robot_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*link.*",
@@ -382,7 +373,7 @@ class IsaacG1Wrapper:
         return False
 
     def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
-        """Reset sim, randomize obstacles (1–3 active), region waypoints, spawn at first waypoint."""
+        """Reset sim, place blue_bin obstacle, region waypoints, spawn at first waypoint."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
@@ -403,18 +394,12 @@ class IsaacG1Wrapper:
         robot.write_root_pose_to_sim(root_pose)
         self._reset_stuck_counters()
 
-        n_active = int(self._rng.integers(1, 4))
-        self._active_obstacles = list(
-            self._rng.choice(self._obstacle_names, size=n_active, replace=False)
-        )
+        self._active_obstacles = list(self._obstacle_names)
 
         for name in self._obstacle_names:
-            if name in self._active_obstacles:
-                x, y = self._sample_obstacle_xy(name, robot_xy, self._rng)
-                z = OBSTACLE_SPECS[name]["default_z"]
-                self._set_obstacle_pose(name, (x, y, z))
-            else:
-                self._set_obstacle_pose(name, HIDDEN_OBSTACLE_POS)
+            x, y = self._sample_obstacle_xy(name, robot_xy, self._rng)
+            z = OBSTACLE_SPECS[name]["default_z"]
+            self._set_obstacle_pose(name, (x, y, z))
 
         self.commands.zero_()
 
@@ -508,24 +493,24 @@ class IsaacG1Wrapper:
             rgb_np = rgb_tensor[..., :3].detach().cpu().numpy()
             if rgb_np.dtype != np.uint8:
                 rgb_np = (rgb_np * 255).clip(0, 255).astype(np.uint8)
-            rgb_np = rotate_sensor_ccw_to_landscape(rgb_np)
-            visual = resize_rgb(rgb_np, VISUAL_SIZE)
+            rgb_np = self._rotate_sensor_ccw_to_landscape(rgb_np)
+            visual = self._resize_rgb(rgb_np, VISUAL_SIZE)
         elif self.visual_mode == "depth_rgb":
             scene = self.env.unwrapped.scene
             depth_list = [
                 scene[n].data.output["distance_to_image_plane"][0].detach().cpu().numpy()
                 for n in self._depth_cam_names
             ]
-            merged = merge_depth_maps_multi(depth_list, max_d=10.0)
-            visual = resize_rgb(
-                rotate_sensor_ccw_to_landscape(depth_to_rgb(merged)), VISUAL_SIZE
+            merged = self._merge_depth_maps_multi(depth_list, max_d=10.0)
+            visual = self._resize_rgb(
+                self._rotate_sensor_ccw_to_landscape(self._depth_to_rgb(merged)), VISUAL_SIZE
             )
         elif self.visual_mode == "lidar_rgb":
             _, ranges, _, _ = self.get_lidar_data()
             valid = np.isfinite(ranges) & (ranges > 1e-4) & (ranges < 10.0)
-            visual = resize_rgb(
-                rotate_sensor_ccw_to_landscape(
-                    lidar_ranges_to_rgb(ranges, valid, out_size=self.img_res)
+            visual = self._resize_rgb(
+                self._rotate_sensor_ccw_to_landscape(
+                    self._lidar_ranges_to_rgb(ranges, valid, out_size=self.img_res)
                 ),
                 VISUAL_SIZE,
             )
