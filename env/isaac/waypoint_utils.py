@@ -8,10 +8,10 @@ import numpy as np
 
 # Default circular regions on the XY plane (matches DataCollection_loop_test.py).
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
-    "front": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 0.5},
+    "front": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 0.6},
     "back": {"center": np.array([3.0, 0.0], dtype=np.float64), "r": 0.3},
-    "left": {"center": np.array([2.0, 0.5], dtype=np.float64), "r": 0.2},
-    "right": {"center": np.array([2.0, -0.5], dtype=np.float64), "r": 0.2},
+    "left": {"center": np.array([2.0, 0.6], dtype=np.float64), "r": 0.3},
+    "right": {"center": np.array([2.0, -0.6], dtype=np.float64), "r": 0.3},
 }
 
 # front -> (left or right) -> back

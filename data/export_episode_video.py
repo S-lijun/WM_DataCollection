@@ -99,7 +99,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Directory for videos (default: dataset_dir, or parent of --input).",
     )
-    parser.add_argument("--fps", type=float, default=15.0, help="Video frame rate.")
+    parser.add_argument(
+        "--obs_subdir",
+        type=str,
+        default="obses",
+        help="Subfolder under dataset_dir with episode_*.pth (e.g. obses or obses_15fps).",
+    )
+    parser.add_argument("--fps", type=float, default=None, help="Video frame rate (default: 15 for obses_15fps, else 60).")
     parser.add_argument(
         "--max_frames",
         type=int,
@@ -114,18 +120,22 @@ def main() -> int:
 
     if args.input is not None:
         out = args.output or args.input.with_suffix(".mp4")
-        export_episode(args.input, out, fps=args.fps, max_frames=args.max_frames)
+        fps = args.fps if args.fps is not None else 60.0
+        export_episode(args.input, out, fps=fps, max_frames=args.max_frames)
         return 0
 
     dataset_dir = args.dataset_dir.resolve()
-    obses_dir = dataset_dir / "obses"
+    obses_dir = dataset_dir / args.obs_subdir
     output_dir = (args.output_dir or dataset_dir).resolve()
+    fps = args.fps
+    if fps is None:
+        fps = 15.0 if args.obs_subdir == "obses_15fps" else 60.0
 
     if args.all:
         for ep_path in _list_episodes(obses_dir):
             idx = _episode_index(ep_path)
             out = output_dir / f"episode_{idx}.mp4"
-            export_episode(ep_path, out, fps=args.fps, max_frames=args.max_frames)
+            export_episode(ep_path, out, fps=fps, max_frames=args.max_frames)
         return 0
 
     episode = 0 if args.episode is None else args.episode
@@ -138,7 +148,7 @@ def main() -> int:
     else:
         out = output_dir / f"episode_{episode}.mp4"
 
-    export_episode(ep_path, out, fps=args.fps, max_frames=args.max_frames)
+    export_episode(ep_path, out, fps=fps, max_frames=args.max_frames)
     return 0
 
 

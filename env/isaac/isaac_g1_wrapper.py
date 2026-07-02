@@ -24,13 +24,21 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
     "blue_bin_0": {
         "default_z": 0.5,
         "rot": (0.5, 0.5, 0.5, 0.5),
-        "spawn_x_range": (1.5, 4.0),
-        "spawn_y_range": (-2.0, 2.0),
+        "spawn_xy": (2.0, 0.0),
     },
 }
 
 HIDDEN_OBSTACLE_POS = (100.0, 100.0, -10.0)
-VISUAL_SIZE = (224, 224)
+DEFAULT_SENSOR_IMG_RES = (640, 480)  # portrait (height, width) before CCW rotation
+
+
+def landscape_output_size(img_res: tuple[int, int]) -> tuple[int, int]:
+    """Portrait sensor resolution → landscape (H, W) after CCW 90° rotation."""
+    return (img_res[1], img_res[0])
+
+
+# Backward-compatible alias for default landscape output (480×640).
+VISUAL_SIZE = landscape_output_size(DEFAULT_SENSOR_IMG_RES)
 
 
 def merge_ray_hits_multi(
@@ -62,6 +70,25 @@ def merge_ray_hits_multi(
     ranges = np.linalg.norm(diff_w, axis=1)
     ranges_xy = np.linalg.norm(diff_w[:, :2], axis=1)
     return diff_w, ranges, ranges_xy
+
+
+def compute_lidar_min_range_labels(
+    origin_np: np.ndarray,
+    hits_list: list[np.ndarray],
+    max_d: float,
+) -> tuple[float, float]:
+    """Match DataCollection_test.py ``lidar_min_range_nonzero_m`` / ``_xy``."""
+    diff_w, ranges, ranges_xy = merge_ray_hits_multi(origin_np, hits_list, max_d)
+    valid_ray = np.isfinite(diff_w).all(axis=1) & (ranges > 1e-4) & (ranges < max_d * 0.999)
+    positive_ranges = ranges[valid_ray]
+    lidar_min_range_nonzero_m = (
+        float(np.min(positive_ranges)) if positive_ranges.size > 0 else float("nan")
+    )
+    positive_ranges_xy = ranges_xy[valid_ray]
+    lidar_min_range_xy_nonzero_m = (
+        float(np.min(positive_ranges_xy)) if positive_ranges_xy.size > 0 else float("nan")
+    )
+    return lidar_min_range_nonzero_m, lidar_min_range_xy_nonzero_m
 
 
 def _object_to_mesh_path(object_name: str, env_prim_root: str) -> str:
@@ -103,6 +130,7 @@ class IsaacG1Wrapper:
         trajectory_region_sequence: Sequence[str | tuple[str, ...]] | None = None,
         max_speed: float = 0.5,
         demos_dir: str | None = None,
+        blue_bin_xy: tuple[float, float] | None = None,
     ):
         self.args_cli = args_cli
         if visual_mode is None:
@@ -110,6 +138,13 @@ class IsaacG1Wrapper:
         self.visual_mode = visual_mode
         self.collect_visual = self.visual_mode != "off"
         self.img_res = img_res
+        self.visual_output_size = landscape_output_size(img_res)
+        if blue_bin_xy is None:
+            blue_bin_xy = (
+                float(getattr(args_cli, "bin_x", OBSTACLE_SPECS["blue_bin_0"]["spawn_xy"][0])),
+                float(getattr(args_cli, "bin_y", OBSTACLE_SPECS["blue_bin_0"]["spawn_xy"][1])),
+            )
+        self._blue_bin_xy = blue_bin_xy
         self.env_prim_root = env_prim_root
         self.lidar_distance_threshold = lidar_distance_threshold
         self.collision_force_threshold = collision_force_threshold
@@ -314,15 +349,10 @@ class IsaacG1Wrapper:
         rot = OBSTACLE_SPECS[name]["rot"]
         obj = self.env.unwrapped.scene[name]
         obj.write_root_pose_to_sim(self._pose_tensor(pos, rot))
-
-    def _sample_obstacle_xy(self, name: str, robot_xy: np.ndarray, rng: np.random.Generator) -> tuple[float, float]:
-        spec = OBSTACLE_SPECS[name]
-        for _ in range(50):
-            x = rng.uniform(*spec["spawn_x_range"])
-            y = rng.uniform(*spec["spawn_y_range"])
-            if np.linalg.norm(np.array([x, y]) - robot_xy) >= 0.8:
-                return float(x), float(y)
-        return float(spec["spawn_x_range"][0]), 0.0
+        if hasattr(obj, "write_root_velocity_to_sim"):
+            obj.write_root_velocity_to_sim(
+                torch.zeros(1, 6, device=self.device, dtype=torch.float32)
+            )
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
         return generate_random_waypoint_sequence(
@@ -392,14 +422,23 @@ class IsaacG1Wrapper:
             (1.0, 0.0, 0.0, 0.0),
         )
         robot.write_root_pose_to_sim(root_pose)
+        if hasattr(robot, "write_root_velocity_to_sim"):
+            robot.write_root_velocity_to_sim(
+                torch.zeros(1, 6, device=self.device, dtype=torch.float32)
+            )
         self._reset_stuck_counters()
 
         self._active_obstacles = list(self._obstacle_names)
+        obstacle_positions: dict[str, tuple[float, float, float]] = {}
 
         for name in self._obstacle_names:
-            x, y = self._sample_obstacle_xy(name, robot_xy, self._rng)
+            if name == "blue_bin_0":
+                x, y = self._blue_bin_xy
+            else:
+                x, y = OBSTACLE_SPECS[name]["spawn_xy"]
             z = OBSTACLE_SPECS[name]["default_z"]
             self._set_obstacle_pose(name, (x, y, z))
+            obstacle_positions[name] = (x, y, z)
 
         self.commands.zero_()
 
@@ -415,6 +454,7 @@ class IsaacG1Wrapper:
         return {
             "active_obstacles": list(self._active_obstacles),
             "robot_xy": robot_xy,
+            "obstacle_positions": obstacle_positions,
             "waypoint": self.waypoint.copy(),
             "waypoints": self.waypoints.copy(),
             "waypoint_region_names": list(self.waypoint_region_names),
@@ -429,14 +469,19 @@ class IsaacG1Wrapper:
         origin = lidars[0].data.pos_w[0].detach().cpu().numpy()
         max_d = float(getattr(lidars[0].cfg, "max_distance", 1e6))
         diff_w, ranges, ranges_xy = merge_ray_hits_multi(origin, hits_list, max_d)
-
-        valid = np.isfinite(diff_w).all(axis=1) & (ranges > 1e-4) & (ranges < max_d * 0.999)
-        pos_ranges = ranges[valid]
-        pos_ranges_xy = ranges_xy[valid]
+        valid_ray = np.isfinite(diff_w).all(axis=1) & (ranges > 1e-4) & (ranges < max_d * 0.999)
+        positive_ranges = ranges[valid_ray]
+        positive_ranges_xy = ranges_xy[valid_ray]
+        lidar_min_m = (
+            float(np.min(positive_ranges)) if positive_ranges.size > 0 else float("nan")
+        )
+        lidar_min_xy_m = (
+            float(np.min(positive_ranges_xy)) if positive_ranges_xy.size > 0 else float("nan")
+        )
 
         stats = {
-            "lidar_min_distance": float(np.min(pos_ranges)) if pos_ranges.size else float("nan"),
-            "lidar_min_distance_xy": float(np.min(pos_ranges_xy)) if pos_ranges_xy.size else float("nan"),
+            "lidar_min_distance": lidar_min_m,
+            "lidar_min_distance_xy": lidar_min_xy_m,
         }
         return diff_w, ranges, ranges_xy, stats
 
@@ -493,8 +538,7 @@ class IsaacG1Wrapper:
             rgb_np = rgb_tensor[..., :3].detach().cpu().numpy()
             if rgb_np.dtype != np.uint8:
                 rgb_np = (rgb_np * 255).clip(0, 255).astype(np.uint8)
-            rgb_np = self._rotate_sensor_ccw_to_landscape(rgb_np)
-            visual = self._resize_rgb(rgb_np, VISUAL_SIZE)
+            visual = self._rotate_sensor_ccw_to_landscape(rgb_np)
         elif self.visual_mode == "depth_rgb":
             scene = self.env.unwrapped.scene
             depth_list = [
@@ -502,17 +546,12 @@ class IsaacG1Wrapper:
                 for n in self._depth_cam_names
             ]
             merged = self._merge_depth_maps_multi(depth_list, max_d=10.0)
-            visual = self._resize_rgb(
-                self._rotate_sensor_ccw_to_landscape(self._depth_to_rgb(merged)), VISUAL_SIZE
-            )
+            visual = self._rotate_sensor_ccw_to_landscape(self._depth_to_rgb(merged))
         elif self.visual_mode == "lidar_rgb":
             _, ranges, _, _ = self.get_lidar_data()
             valid = np.isfinite(ranges) & (ranges > 1e-4) & (ranges < 10.0)
-            visual = self._resize_rgb(
-                self._rotate_sensor_ccw_to_landscape(
-                    self._lidar_ranges_to_rgb(ranges, valid, out_size=self.img_res)
-                ),
-                VISUAL_SIZE,
+            visual = self._rotate_sensor_ccw_to_landscape(
+                self._lidar_ranges_to_rgb(ranges, valid, out_size=self.img_res)
             )
         else:
             raise RuntimeError(f"Unsupported visual_mode: {self.visual_mode}")
@@ -531,7 +570,9 @@ class IsaacG1Wrapper:
         joint_pos = data.joint_pos[0, : self.num_joints].cpu().numpy()
         joint_vel = data.joint_vel[0, : self.num_joints].cpu().numpy()
         cmds = self.commands[0].detach().cpu().numpy()
-        lidar_min = np.array([self.get_lidar_min_distance()], dtype=np.float64)
+        # Fresh read; same label as DataCollection_test ``lidar_min_range_nonzero_m``.
+        _, _, _, lidar_stats = self.get_lidar_data()
+        lidar_min = np.array([lidar_stats["lidar_min_distance"]], dtype=np.float64)
         return np.concatenate([base_pos, base_quat, joint_pos, joint_vel, cmds, lidar_min])
 
     def apply_velocity_command(self, action: np.ndarray | torch.Tensor) -> tuple[Any, bool, bool, dict]:
