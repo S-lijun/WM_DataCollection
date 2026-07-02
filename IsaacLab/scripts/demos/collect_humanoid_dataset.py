@@ -85,6 +85,11 @@ parser.add_argument(
     default=DEFAULT_CAMERA_FPS,
     help="Sim-time rate for obses_15fps/ subsampling (matches DataCollection_test camera_fps).",
 )
+parser.add_argument(
+    "--save_full_obses",
+    action="store_true",
+    help="Also save per-control-step obses/ (default: only obses_15fps/).",
+)
 args_cli, _ = parser.parse_known_args()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -123,7 +128,8 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     obses_dir = output_path / "obses"
-    obses_dir.mkdir(exist_ok=True)
+    if args_cli.save_full_obses:
+        obses_dir.mkdir(exist_ok=True)
     obses_15fps_dir = output_path / OBSES_15FPS_DIRNAME
     if _visual_mode != "off":
         obses_15fps_dir.mkdir(exist_ok=True)
@@ -205,7 +211,8 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         all_states.append(torch.stack(episode_states))
         all_costs.append(torch.stack(episode_costs))
         seq_lengths.append(len(episode_actions))
-        torch.save(torch.stack(episode_obs).cpu(), obses_dir / f"episode_{ep}.pth")
+        if args_cli.save_full_obses:
+            torch.save(torch.stack(episode_obs).cpu(), obses_dir / f"episode_{ep}.pth")
         if _visual_mode != "off":
             idx_15 = subsample_frame_indices(
                 len(episode_obs), wrapper.sim_dt, args_cli.camera_fps
@@ -247,6 +254,7 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
             "sensor_img_res": wrapper.img_res,
             "control_fps": 1.0 / wrapper.sim_dt,
             "visual_fps": args_cli.camera_fps,
+            "save_full_obses": args_cli.save_full_obses,
             "obses_15fps_dir": OBSES_15FPS_DIRNAME,
             "action_dim": action_dim,
             "state_dim": state_dim,
