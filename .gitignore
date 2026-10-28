@@ -19,4 +19,5 @@ Data/*
 
 # Model checkpoints (often >100MB, GitHub rejects them)
 wm_ckpt_*/
+wm_ckpt_*.zip
 **/*.pth
